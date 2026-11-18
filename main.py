@@ -22,6 +22,53 @@ import subprocess
 import sys
 
 
+# 消息里的图片不能横向滚动，先按阅读宽度排版，再测量需要截图的区域。
+IMAGE_LAYOUT_CSS = """
+    body { margin: 0; overflow-wrap: anywhere; }
+    :where(main, article, section, header, footer, aside, div, figure, table,
+           pre, img, svg, canvas, video) {
+        box-sizing: border-box;
+        max-width: 100% !important;
+        min-width: 0 !important;
+    }
+    pre, pre code {
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+    }
+    th, td { overflow-wrap: anywhere; }
+    img { height: auto; }
+"""
+
+
+async def _screenshot_content(page, output_image_path):
+    # 代码行和常见卡片已由 CSS 换行。显式指定列宽的网格等仍可能更宽。
+    # 展开真正溢出的横向滚动容器，避免把滚动条当成内容截进图片。
+    clip = await page.evaluate("""() => {
+        const body = document.body;
+        for (const el of body.querySelectorAll('*')) {
+            if (el.clientWidth && el.scrollWidth > el.clientWidth + 1 &&
+                ['auto', 'scroll'].includes(getComputedStyle(el).overflowX)) {
+                el.style.setProperty('overflow', 'visible', 'important');
+            }
+        }
+        const rect = body.getBoundingClientRect();
+        const x = Math.max(0, Math.floor(rect.left + window.scrollX));
+        const y = Math.max(0, Math.floor(rect.top + window.scrollY));
+        return {
+            x, y,
+            width: Math.ceil(rect.left + window.scrollX +
+                Math.max(rect.width, body.scrollWidth)) - x,
+            height: Math.ceil(rect.top + window.scrollY +
+                Math.max(rect.height, body.scrollHeight)) - y
+        };
+    }""")
+    # 极端的固定画布可能要求分配数 GB 的位图，此时走已有的文字回退。
+    pixel_ratio = await page.evaluate("window.devicePixelRatio")
+    if clip["width"] * clip["height"] * pixel_ratio ** 2 > 40_000_000:
+        raise ValueError("排版后的图片超过 4000 万像素，请拆分内容后渲染")
+    await page.screenshot(path=output_image_path, full_page=True, clip=clip)
+
+
 async def markdown_to_image_playwright(
     md_text: str,
     output_image_path: str,
@@ -84,6 +131,7 @@ async def markdown_to_image_playwright(
             .mathjax-overflow-fallback {{
                 transform-origin: left center;
             }}
+            {layout_css}
         </style>
         <script type="text/javascript" async
             src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/MathJax.js?config=TeX-MML-AM_CHTML">
@@ -117,7 +165,7 @@ async def markdown_to_image_playwright(
 
     # 4. 填充 HTML 模板，同时传入内容和宽度样式
     full_html = html_template.format(
-        content=html_content, width_style=width_style)
+        content=html_content, width_style=width_style, layout_css=IMAGE_LAYOUT_CSS)
 
     # 5. 使用 Playwright 进行截图
     async with async_playwright() as p:
@@ -126,6 +174,8 @@ async def markdown_to_image_playwright(
             device_scale_factor=scale
         )
         page = await context.new_page()
+        if width:
+            await page.set_viewport_size({"width": width, "height": 720})
 
         await page.set_content(full_html, wait_until="networkidle")
 
@@ -167,11 +217,7 @@ async def markdown_to_image_playwright(
             }
         """)
 
-        element_handle = await page.query_selector('body')
-        if not element_handle:
-            raise Exception("无法找到 <body> 元素进行截图。")
-
-        await element_handle.screenshot(path=output_image_path)
+        await _screenshot_content(page, output_image_path)
         await browser.close()
         print(f"图片已保存到: {output_image_path}")
 
@@ -199,6 +245,7 @@ async def html_to_image_playwright(
                 -webkit-font-smoothing: antialiased;
                 text-rendering: optimizeLegibility;
             }}
+            {IMAGE_LAYOUT_CSS}
         </style>
     """
 
@@ -215,6 +262,8 @@ async def html_to_image_playwright(
         )
     else:
         html_content = html_text + render_style
+    if not re.search(r"<!doctype\s+html\b", html_content, re.IGNORECASE):
+        html_content = "<!doctype html>\n" + html_content
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -224,16 +273,14 @@ async def html_to_image_playwright(
         )
         page = await context.new_page()
 
+        if width:
+            await page.set_viewport_size({"width": width, "height": 720})
+
         # HTML 来自模型输出，禁止页面访问外部资源或内网地址。
         await page.route("**/*", lambda route: route.abort())
         await page.set_content(html_content, wait_until="domcontentloaded")
 
-        element_handle = await page.query_selector("body")
-        if not element_handle:
-            await browser.close()
-            raise Exception("无法找到 <body> 元素进行截图。")
-
-        await element_handle.screenshot(path=output_image_path)
+        await _screenshot_content(page, output_image_path)
         await browser.close()
         print(f"图片已保存到: {output_image_path}")
 
@@ -421,7 +468,8 @@ class MarkdownConverterPlugin(Star):
 3. 可以使用 HTML 文档或 HTML 片段，并可通过内联 CSS 或 `<style>` 设置样式。
 4. 不要使用 JavaScript、外部样式表、外部字体或网络图片；渲染器不会执行脚本或加载外部资源。
 5. 普通对话和解释放在标签外，只把需要生成图片的正式内容放入标签内。
-6. 确保标签内 HTML 结构完整，文本清晰，并适合约 600px 宽度展示。
+6. 按约 600px 的手机单栏布局排版。卡片宽度随容器变化，允许正文和徽标换行；
+   避免固定大宽度、横向滚动和用 overflow:hidden 截断正文。
 
 例如：
 <ml>
